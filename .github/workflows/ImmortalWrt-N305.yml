@@ -1,0 +1,206 @@
+name: Build ImmortalWrt x86_64 (24.10, N305)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+env:
+  IB_VERSION: 24.10.0
+  TARGET: x86/64
+  PROFILE: generic
+  ROOTFS_PARTSIZE: 1024
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            gawk \
+            unzip \
+            wget \
+            file \
+            rsync \
+            xz-utils \
+            zstd
+
+      - name: Download ImmortalWrt ImageBuilder
+        run: |
+          wget https://downloads.immortalwrt.org/releases/${IB_VERSION}/targets/x86/64/immortalwrt-imagebuilder-${IB_VERSION}-x86-64.Linux-x86_64.tar.xz
+          tar -xf immortalwrt-imagebuilder-${IB_VERSION}-x86-64.Linux-x86_64.tar.xz
+
+      - name: Prepare custom files (uci-defaults + sysctl)
+        run: |
+          IB_DIR=immortalwrt-imagebuilder-${IB_VERSION}-x86-64.Linux-x86_64
+
+          mkdir -p ${IB_DIR}/files/etc/uci-defaults
+          mkdir -p ${IB_DIR}/files/etc/sysctl.d
+
+          ############################################
+          # 99-custom-network (内嵌生成)
+          ############################################
+          cat > ${IB_DIR}/files/etc/uci-defaults/99-custom-network << 'EOF'
+          #!/bin/sh
+          logger -t uci-defaults "Apply custom network (x86)"
+
+          ################################
+          # Network
+          ################################
+          uci -q batch << 'EOT'
+          delete network.lan
+          delete network.wan
+          delete network.wan6
+
+          set network.lan_dev=device
+          set network.lan_dev.name='br-lan'
+          set network.lan_dev.type='bridge'
+
+          set network.lan=interface
+          set network.lan.device='br-lan'
+          set network.lan.proto='static'
+          set network.lan.ipaddr='192.168.100.1'
+          set network.lan.netmask='255.255.255.0'
+          set network.lan.ip6assign='60'
+
+          set network.wan=interface
+          set network.wan.device='eth0'
+          set network.wan.proto='dhcp'
+
+          set network.wan6=interface
+          set network.wan6.device='eth0'
+          set network.wan6.proto='dhcpv6'
+          EOT
+
+          # 自动识别 LAN 口（x86 常见命名）
+          for p in eth1 eth2 eth3 eth4 enp2s0 enp3s0 enp4s0; do
+            [ -e "/sys/class/net/$p" ] && \
+              uci add_list network.lan_dev.ports="$p"
+          done
+
+          ################################
+          # DHCP
+          ################################
+          uci -q batch << 'EOT'
+          set dhcp.lan.start='50'
+          set dhcp.lan.limit='200'
+          set dhcp.lan.leasetime='12h'
+          EOT
+
+          ################################
+          # Firewall / Offloading
+          ################################
+          uci show firewall | grep -q fullcone && \
+            uci set firewall.@defaults[0].fullcone='1'
+
+          uci set firewall.@defaults[0].flow_offloading='1'
+          uci set firewall.@defaults[0].flow_offloading_hw='1'
+
+          ################################
+          # System
+          ################################
+          uci -q batch << 'EOT'
+          set system.@system[0].hostname='POPOS'
+          set system.@system[0].timezone='CST-8'
+          set system.@system[0].zonename='Asia/Shanghai'
+          EOT
+
+          ################################
+          # LuCI
+          ################################
+          uci set luci.main.lang='zh_cn'
+          uci set uhttpd.main.listen_http='0.0.0.0:80'
+          uci set uhttpd.main.listen_https='0.0.0.0:443'
+
+          if [ -d /www/luci-static/argon ]; then
+            uci set luci.main.mediaurlbase='/luci-static/argon'
+          fi
+
+          ################################
+          # SmartDNS
+          ################################
+          if [ -f /etc/init.d/smartdns ]; then
+            uci -q delete smartdns.@server
+            uci -q batch << 'EOT'
+          set smartdns.@smartdns[0].enabled='1'
+          set smartdns.@smartdns[0].port='6053'
+          set smartdns.@smartdns[0].tcp_server='1'
+          set smartdns.@smartdns[0].ipv6_server='1'
+          set smartdns.@smartdns[0].dualstack_ip_selection='1'
+          set smartdns.@smartdns[0].prefetch_domain='1'
+          set smartdns.@smartdns[0].cache_size='10000'
+
+          add smartdns server
+          set smartdns.@server[-1].name='aliyun'
+          set smartdns.@server[-1].ip='223.5.5.5'
+          set smartdns.@server[-1].type='udp'
+
+          add smartdns server
+          set smartdns.@server[-1].name='dnspod'
+          set smartdns.@server[-1].ip='119.29.29.29'
+          set smartdns.@server[-1].type='udp'
+          EOT
+            /etc/init.d/smartdns enable
+          fi
+
+          logger -t uci-defaults "Custom network done"
+          exit 0
+          EOF
+
+          chmod +x ${IB_DIR}/files/etc/uci-defaults/99-custom-network
+
+          ############################################
+          # sysctl (BBR)
+          ############################################
+          cat > ${IB_DIR}/files/etc/sysctl.d/99-custom.conf << 'EOF'
+          net.ipv4.tcp_congestion_control=bbr
+          net.core.default_qdisc=fq
+          net.ipv4.tcp_fastopen=3
+          net.ipv4.tcp_slow_start_after_idle=0
+          net.ipv4.tcp_mtu_probing=1
+
+          net.netfilter.nf_conntrack_max=131072
+          net.netfilter.nf_conntrack_tcp_timeout_established=7200
+
+          vm.swappiness=10
+          EOF
+
+      - name: Build firmware
+        run: |
+          IB_DIR=immortalwrt-imagebuilder-${IB_VERSION}-x86-64.Linux-x86_64
+          cd ${IB_DIR}
+
+          make image PROFILE="${PROFILE}" \
+            FILES="files" \
+            ROOTFS_PARTSIZE=${ROOTFS_PARTSIZE} \
+            PACKAGES="\
+              luci \
+              luci-i18n-base-zh-cn \
+              luci-theme-argon \
+              ttyd \
+              samba4 \
+              smartdns \
+              luci-app-smartdns \
+              openclash \
+              openlist \
+              filebrowser \
+              bash \
+              curl \
+              ethtool \
+              kmod-tcp-bbr \
+            "
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-x86_64-24.10-n305
+          path: |
+            immortalwrt-imagebuilder-${{ env.IB_VERSION }}-x86-64.Linux-x86_64/bin/targets/x86/64/*.img.gz
